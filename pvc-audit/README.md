@@ -1,4 +1,4 @@
-# **vSphere Kubernetes Service (VKS) PVC Audit Script**
+# **VKS PVC Audit Script**
 
 This script (vks\_disk\_audit.py) audits Kubernetes Persistent Volume Claims (PVCs) within a specific vSphere Supervisor Namespace. It correlates Kubernetes objects with underlying vSphere Cloud Native Storage (CNS) volumes to provide a comprehensive view of storage consumption across all Guest Clusters in that namespace.
 
