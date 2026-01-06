@@ -6,15 +6,6 @@ import sys
 import os
 import shutil
 
-# ==============================================================================
-# Script Name: vks_disk_audit.py
-# Description: Maps Kubernetes PVs in a Supervisor Namespace to vSphere CNS Volumes
-#              using 'kubectl' and 'govc' via subprocess.
-#              Audits ALL clusters in the provided namespace.
-#              Separates output by Node-Attached volumes and General Cluster PVCs.
-#              Supports JSON output via --json flag.
-# Requirements: python3, kubectl, govc
-# ==============================================================================
 
 def check_dependencies():
     """Ensures required tools are installed."""
@@ -34,11 +25,9 @@ def run_command(cmd_list):
         )
         return result.stdout
     except subprocess.CalledProcessError as e:
-        # Don't exit immediately on simple errors, let caller handle or return empty
         return None
 
 def main():
-    # Argument Parsing
     json_output = False
     args = sys.argv[1:]
     if "--json" in args:
@@ -52,19 +41,16 @@ def main():
 
     namespace = args[0]
 
-    # Helper for logging (suppress in JSON mode)
     def log(msg):
         if not json_output:
             print(msg)
 
-    # Validate Environment
     check_dependencies()
     if not os.environ.get("GOVC_URL"):
         log("Warning: GOVC_URL is not set. Ensure govc is configured.")
 
     log(f"--- Starting Audit for Namespace: {namespace} ---")
 
-    # 1. Build a Map of Node UIDs to Cluster Names AND Node Names
     log("Mapping VSphereMachines to Clusters...")
     vm_cmd = [
         "kubectl", "get", "vspheremachine",
@@ -82,7 +68,6 @@ def main():
                 uid = vm["metadata"].get("uid")
                 name = vm["metadata"]["name"]
                 labels = vm["metadata"].get("labels", {})
-                # CAPI Cluster Name Label
                 cluster_name = labels.get("cluster.x-k8s.io/cluster-name", "Unknown")
                 if uid:
                     node_info[uid] = {
@@ -94,7 +79,6 @@ def main():
 
     log(f"Mapped {len(node_info)} nodes across clusters.")
 
-    # 2. Get ALL PVCs in namespace
     log("Querying all PVCs in namespace...")
     pvc_cmd = [
         "kubectl", "get", "pvc",
@@ -123,7 +107,6 @@ def main():
 
     log(f"Found {len(all_pvcs)} PVC(s). Resolving PV handles...")
 
-    # 3. Extract Volume Handles and Separate Lists
     node_volumes = []
     cluster_pvcs = []
     volume_ids = []
@@ -138,7 +121,6 @@ def main():
         
         owner_refs = pvc.get("metadata", {}).get("ownerReferences", [])
         
-        # 3a. Try to associate via VSphereMachine OwnerReference
         for ref in owner_refs:
             if ref.get("uid") in node_info:
                 info = node_info[ref.get("uid")]
@@ -147,20 +129,16 @@ def main():
                 is_node_attached = True
                 break
         
-        # 3b. Fallback: Check Labels if not attached
         if not is_node_attached:
             labels = pvc.get("metadata", {}).get("labels", {})
-            # Priority Check: Look for dynamic key ending in /TKGService
             for key in labels.keys():
                 if key.endswith("/TKGService"):
                     cluster_assoc = key.split("/TKGService")[0]
                     break
             
-            # Secondary Check: Standard CAPI label
             if cluster_assoc == "Unattached/Unknown" and "cluster.x-k8s.io/cluster-name" in labels:
                 cluster_assoc = labels["cluster.x-k8s.io/cluster-name"]
 
-        # Prepare Entry object
         entry = {
             "pvc_name": pvc_name,
             "cluster": cluster_assoc,
@@ -169,10 +147,8 @@ def main():
         }
 
         if not pv_name:
-            # Record unbound PVCs
             entry["volume_handle"] = None
         else:
-            # Fetch PV details to get the CSI Handle
             pv_cmd = ["kubectl", "get", "pv", pv_name, "-o", "json"]
             pv_raw = run_command(pv_cmd)
             
@@ -192,13 +168,11 @@ def main():
             else:
                 entry["volume_handle"] = "Not CSI/Found"
 
-        # Sort into appropriate list
         if is_node_attached:
             node_volumes.append(entry)
         else:
             cluster_pvcs.append(entry)
 
-    # 4. Query govc (Batch Mode)
     cns_data_map = {}
     if volume_ids:
         log(f"Querying vSphere CNS for {len(volume_ids)} volumes...")
@@ -208,7 +182,6 @@ def main():
         if govc_raw:
             try:
                 govc_output = json.loads(govc_raw)
-                # Fallback keys for different govc versions
                 volumes = govc_output.get("volume", govc_output.get("Volumes", []))
                 
                 for vol in volumes:
@@ -224,7 +197,6 @@ def main():
             except json.JSONDecodeError:
                 log("Error parsing govc output.")
 
-    # 5. Data Enrichment Function
     def enrich_entry(entry, cns_data_map):
         handle = entry["volume_handle"]
         
@@ -236,10 +208,8 @@ def main():
         if handle and handle in cns_data_map:
             vol_info = cns_data_map[handle]
             
-            # Volume Name
             vol_name = vol_info.get("name", vol_info.get("Name", "-"))
 
-            # Datastore
             if "datastoreUrl" in vol_info:
                 raw_ds = vol_info["datastoreUrl"]
                 if raw_ds.startswith("ds:///vmfs/volumes/"):
@@ -249,19 +219,16 @@ def main():
             elif "Datastore" in vol_info and vol_info["Datastore"]:
                 ds_name = vol_info["Datastore"].get("Name", "Unknown")
             
-            # Capacity
             backing = vol_info.get("backingObjectDetails", vol_info.get("BackingObjectDetails", {}))
             cap_mb = backing.get("capacityInMb", backing.get("CapacityInMB", 0))
             if cap_mb > 0:
                 capacity_str = f"{cap_mb / 1024:.2f} GB"
 
-            # Referred Entity Logic
             metadata = vol_info.get("metadata", {})
             entity_metadata_list = metadata.get("entityMetadata", [])
             
             refs = []
             for em in entity_metadata_list:
-                # Filter out Supervisor references to keep output clean for Guest Cluster focus
                 e_cluster = em.get("clusterID", "")
                 if "vspheresupervisor" in e_cluster.lower():
                     continue
@@ -287,11 +254,9 @@ def main():
         entry["referred_entity"] = referred_entity_str
         return entry
 
-    # Process lists with enrichment
     processed_node_volumes = [enrich_entry(e, cns_data_map) for e in node_volumes]
     processed_cluster_pvcs = [enrich_entry(e, cns_data_map) for e in cluster_pvcs]
 
-    # 6. Output Generation
     if json_output:
         output_data = {
             "node_volumes": processed_node_volumes,
@@ -300,19 +265,15 @@ def main():
         print(json.dumps(output_data, indent=2))
         sys.exit(0)
 
-    # Table Printing Helper
     def print_table(data_list, include_node=False):
-        # Updated format strings to include Volume Name
         
         if include_node:
-            # Columns: PVC Name, Node, Cluster, Volume Name, Volume ID, Datastore, Capacity, Referred Entity
             header_fmt = "{:<30} {:<30} {:<20} {:<35} {:<40} {:<20} {:<10} {}"
             row_fmt = "{:<30} {:<30} {:<20} {:<35} {:<40} {:<20} {:<10} {}"
             
             print(header_fmt.format("PVC Name", "Node", "Cluster", "Volume Name", "Volume ID", "Datastore", "Capacity", "Referred Entity"))
             print("-" * 210)
         else:
-            # Columns: PVC Name, Cluster, Volume Name, Volume ID, Datastore, Capacity, Referred Entity
             header_fmt = "{:<30} {:<20} {:<35} {:<40} {:<20} {:<10} {}"
             row_fmt = "{:<30} {:<20} {:<35} {:<40} {:<20} {:<10} {}"
             
@@ -323,7 +284,6 @@ def main():
             display_handle = item["volume_handle"] if item["volume_handle"] else "N/A"
             vol_name = item["volume_name"]
             
-            # Truncation logic removed as requested
 
             if include_node:
                 print(row_fmt.format(
